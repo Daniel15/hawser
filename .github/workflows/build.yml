@@ -43,6 +43,15 @@ jobs:
       - name: Test
         run: go test -v ./...
 
+      # Runs before building the binaries, since GoReleaser requires dist/ to
+      # be empty.
+      - name: Build Debian packages
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --skip=publish,docker,archive,sign
+
       - name: Build binaries
         run: |
           mkdir -p dist
@@ -55,5 +64,113 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: binaries
-          path: dist/
+          path: |
+            dist/hawser-*
+            dist/*.deb
           retention-days: 7
+
+  deb-e2e:
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      HAWSER_URL: http://127.0.0.1:2376
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: dist
+
+      - name: Install package
+        run: |
+          deb=$(ls dist/hawser_*_linux_amd64.deb)
+          # The runner already has docker-ce and the Compose plugin, so skip
+          # Recommends to leave its Docker setup alone.
+          sudo DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y --no-install-recommends "./$deb"
+
+      - name: Check service
+        run: |
+          # Wait until health check endpoint works
+          for _ in $(seq 30); do
+            curl -fsS "$HAWSER_URL/_hawser/health" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          systemctl is-enabled hawser
+          systemctl is-active hawser
+          test "$(systemctl show -p User --value hawser)" = hawser
+          test "$(sudo stat -c '%a %U' /etc/hawser/config)" = "600 hawser"
+
+      - name: Read generated token
+        run: |
+          token=$(sudo sed -n 's/^TOKEN="\(.*\)"$/\1/p' /etc/hawser/config)
+          if [ -z "$token" ]; then
+            echo "No TOKEN in /etc/hawser/config" >&2
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          echo "HAWSER_TOKEN=$token" >>"$GITHUB_ENV"
+
+      - name: Health check
+        run: |
+          curl -fsS "$HAWSER_URL/_hawser/health" | jq -e '.status == "healthy"'
+
+      - name: Check token authentication
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' "$HAWSER_URL/_hawser/info")
+          if [ "$status" != 401 ]; then
+            echo "Expected 401 without a token, got $status" >&2
+            exit 1
+          fi
+          curl -fsS -H "X-Hawser-Token: $HAWSER_TOKEN" "$HAWSER_URL/_hawser/info" |
+            jq -e '.agentId and .hawserVersion'
+
+      - name: Create stack
+        run: |
+          request=$(jq -n '{
+            operation: "up",
+            projectName: "e2e",
+            composeFileName: "compose.yaml",
+            files: {
+              "compose.yaml": "services:\n  web:\n    image: busybox\n    command: sleep 3600\n    volumes:\n      - ./data:/data\n",
+              "data/hello.txt": "hello\n"
+            }
+          }')
+          result=$(curl -sS -m 300 -H "X-Hawser-Token: $HAWSER_TOKEN" \
+            -H 'Content-Type: application/json' -d "$request" \
+            "$HAWSER_URL/_hawser/compose")
+          echo "$result" | jq .
+          echo "$result" | jq -e '.success == true'
+
+          # Check the container through Hawser's Docker API proxy.
+          container=$(curl -fsS -H "X-Hawser-Token: $HAWSER_TOKEN" \
+            "$HAWSER_URL/containers/e2e-web-1/json")
+          echo "$container" | jq -e '.State.Running == true'
+          echo "$container" |
+            jq -e '.Mounts[] | select(.Destination == "/data") | .Source == "/var/lib/hawser/stacks/e2e/data"'
+          sudo test -f /var/lib/hawser/stacks/e2e/data/hello.txt
+
+      - name: Remove stack
+        run: |
+          result=$(curl -sS -m 120 -H "X-Hawser-Token: $HAWSER_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d '{"operation": "down", "projectName": "e2e", "workDir": "/var/lib/hawser/stacks/e2e"}' \
+            "$HAWSER_URL/_hawser/compose")
+          echo "$result" | jq .
+          echo "$result" | jq -e '.success == true'
+          status=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Hawser-Token: $HAWSER_TOKEN" \
+            "$HAWSER_URL/containers/e2e-web-1/json")
+          if [ "$status" != 404 ]; then
+            echo "Expected the container to be gone (404), got $status" >&2
+            exit 1
+          fi
+
+      - name: Show diagnostics
+        if: failure()
+        run: |
+          systemctl status hawser --no-pager || true
+          sudo journalctl -u hawser --no-pager -n 200 || true
+          sudo sed 's/^TOKEN=.*/TOKEN=<redacted>/' /etc/hawser/config || true
